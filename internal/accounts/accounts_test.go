@@ -3,6 +3,8 @@ package accounts
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +91,33 @@ func TestRenameAllowsCaseOnlyChange(t *testing.T) {
 	names := ListAccountNames(paths)
 	if len(names) != 1 || names[0] != "Hxc" {
 		t.Fatalf("expected only renamed account Hxc, got %v", names)
+	}
+}
+
+func TestUsePreservesCanonicalAliasCaseOnCaseInsensitiveLookup(t *testing.T) {
+	t.Parallel()
+
+	paths := config.PathsFromHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.AuthFile), 0o755); err != nil {
+		t.Fatalf("mkdir auth dir: %v", err)
+	}
+	if err := EnsureAccountsDir(paths); err != nil {
+		t.Fatalf("EnsureAccountsDir: %v", err)
+	}
+
+	if err := os.WriteFile(paths.AuthFile, []byte(`{"tokens":{"account_id":"acct-old"}}`), 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.AccountsDir, "Hxc.json"), []byte(`{"tokens":{"account_id":"acct-1"}}`), 0o600); err != nil {
+		t.Fatalf("write account: %v", err)
+	}
+
+	if err := Use(paths, "hxc"); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+
+	if got := DetectCurrentAccountName(paths); got != "Hxc" {
+		t.Fatalf("expected canonical alias Hxc, got %q", got)
 	}
 }
 
@@ -308,6 +337,120 @@ func TestPruneReportsDeleteFailures(t *testing.T) {
 	}
 	if _, ok := meta.LastChecked["two"]; !ok {
 		t.Fatalf("expected metadata for failed removal to remain after prune failure")
+	}
+}
+
+func TestBuildListRowsIncludesSubscriptionInfo(t *testing.T) {
+	t.Parallel()
+
+	paths := config.PathsFromHome(t.TempDir())
+	if err := EnsureAccountsDir(paths); err != nil {
+		t.Fatalf("EnsureAccountsDir: %v", err)
+	}
+
+	doc := `{"tokens":{"account_id":"acct-1","access_token":"token-1","id_token":"` + tokenWithClaims(map[string]any{
+		"https://api.openai.com/profile": map[string]any{
+			"email": "saved@example.com",
+		},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct-1",
+			"chatgpt_plan_type":  "plus",
+		},
+	}) + `"}}`
+	if err := os.WriteFile(filepath.Join(paths.AccountsDir, "work.json"), []byte(doc), 0o600); err != nil {
+		t.Fatalf("write account: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"email":     "live@example.com",
+				"plan_type": "plus",
+				"rate_limit": map[string]any{
+					"allowed": true,
+				},
+			})
+		case "/subscription":
+			if got := r.URL.Query().Get("account_id"); got != "acct-1" {
+				t.Fatalf("expected account_id acct-1, got %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"plan_type":    "plus",
+				"active_until": "2026-04-14T11:17:05Z",
+				"will_renew":   true,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Network.UsageURL = server.URL + "/usage"
+	cfg.Network.SubscriptionURL = server.URL + "/subscription"
+	rows := BuildListRows(paths, cfg, server.Client(), false, time.Unix(1_700_000_000, 0))
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0].Plan != "plus renews 2026-04-14" {
+		t.Fatalf("expected subscription info in plan, got %+v", rows.Rows[0])
+	}
+	if rows.Rows[0].Account != "work <live@example.com>" {
+		t.Fatalf("expected live email to be used, got %+v", rows.Rows[0])
+	}
+}
+
+func TestBuildListRowsKeepsUsagePlanWhenSubscriptionSummaryIsSparse(t *testing.T) {
+	t.Parallel()
+
+	paths := config.PathsFromHome(t.TempDir())
+	if err := EnsureAccountsDir(paths); err != nil {
+		t.Fatalf("EnsureAccountsDir: %v", err)
+	}
+
+	doc := `{"tokens":{"account_id":"acct-1","access_token":"token-1","id_token":"` + tokenWithClaims(map[string]any{
+		"https://api.openai.com/profile": map[string]any{
+			"email": "saved@example.com",
+		},
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acct-1",
+			"chatgpt_plan_type":  "plus",
+		},
+	}) + `"}}`
+	if err := os.WriteFile(filepath.Join(paths.AccountsDir, "work.json"), []byte(doc), 0o600); err != nil {
+		t.Fatalf("write account: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"email":     "live@example.com",
+				"plan_type": "plus",
+				"rate_limit": map[string]any{
+					"allowed": true,
+				},
+			})
+		case "/subscription":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"will_renew": true,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Network.UsageURL = server.URL + "/usage"
+	cfg.Network.SubscriptionURL = server.URL + "/subscription"
+	rows := BuildListRows(paths, cfg, server.Client(), false, time.Unix(1_700_000_000, 0))
+	if len(rows.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(rows.Rows))
+	}
+	if rows.Rows[0].Plan != "plus" {
+		t.Fatalf("expected usage plan to be preserved, got %+v", rows.Rows[0])
 	}
 }
 

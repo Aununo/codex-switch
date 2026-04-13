@@ -12,6 +12,7 @@ import (
 
 const (
 	DefaultUsageURL            = "https://chatgpt.com/backend-api/wham/usage"
+	DefaultSubscriptionURL     = "https://chatgpt.com/backend-api/subscriptions"
 	DefaultUsageTimeoutSeconds = 6
 	DefaultMaxUsageWorkers     = 8
 	DefaultRefreshURL          = "https://auth.openai.com/oauth/token"
@@ -40,6 +41,7 @@ type RefreshConfig struct {
 
 type NetworkConfig struct {
 	UsageURL            string `json:"usageURL"`
+	SubscriptionURL     string `json:"subscriptionURL"`
 	UsageTimeoutSeconds int    `json:"usageTimeoutSeconds"`
 	MaxUsageWorkers     int    `json:"maxUsageWorkers"`
 	RefreshURL          string `json:"refreshURL"`
@@ -74,6 +76,7 @@ func DefaultConfig() Config {
 		},
 		Network: NetworkConfig{
 			UsageURL:            DefaultUsageURL,
+			SubscriptionURL:     DefaultSubscriptionURL,
 			UsageTimeoutSeconds: DefaultUsageTimeoutSeconds,
 			MaxUsageWorkers:     DefaultMaxUsageWorkers,
 			RefreshURL:          DefaultRefreshURL,
@@ -165,6 +168,9 @@ func migrateConfig(raw map[string]any, defaults Config) (Config, bool, error) {
 		if value, ok := stringValue(networkMap["usageURL"]); ok {
 			cfg.Network.UsageURL = value
 		}
+		if value, ok := stringValue(networkMap["subscriptionURL"]); ok {
+			cfg.Network.SubscriptionURL = value
+		}
 		if value, ok := intValue(networkMap["usageTimeoutSeconds"]); ok {
 			cfg.Network.UsageTimeoutSeconds = value
 		}
@@ -184,6 +190,10 @@ func migrateConfig(raw map[string]any, defaults Config) (Config, bool, error) {
 
 	if value, ok := stringValue(raw["wham_usage_url"]); ok {
 		cfg.Network.UsageURL = value
+		changed = true
+	}
+	if value, ok := stringValue(raw["subscription_url"]); ok {
+		cfg.Network.SubscriptionURL = value
 		changed = true
 	}
 	if value, ok := intValue(raw["usage_timeout_seconds"]); ok {
@@ -213,6 +223,10 @@ func migrateConfig(raw map[string]any, defaults Config) (Config, bool, error) {
 	}
 	if cfg.Network.UsageURL == "" {
 		cfg.Network.UsageURL = defaults.Network.UsageURL
+		changed = true
+	}
+	if cfg.Network.SubscriptionURL == "" {
+		cfg.Network.SubscriptionURL = defaults.Network.SubscriptionURL
 		changed = true
 	}
 	if cfg.Network.UsageTimeoutSeconds <= 0 {

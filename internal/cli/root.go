@@ -1,18 +1,20 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-switch/internal/accounts"
 	"codex-switch/internal/auth"
 	"codex-switch/internal/config"
+	"codex-switch/internal/sessions"
 	"codex-switch/internal/support"
 	"codex-switch/internal/usage"
 
@@ -83,6 +85,7 @@ func (a *App) newRootCmd() *cobra.Command {
 	rootCmd.AddCommand(a.newUseCmd())
 	rootCmd.AddCommand(a.newListCmd())
 	rootCmd.AddCommand(a.newCurrentCmd())
+	rootCmd.AddCommand(a.newThreadsCmd())
 	rootCmd.AddCommand(a.newSyncCmd())
 	rootCmd.AddCommand(a.newRenameCmd())
 	rootCmd.AddCommand(a.newDoctorCmd())
@@ -152,6 +155,7 @@ func (a *App) newSaveCmd() *cobra.Command {
 
 func (a *App) newUseCmd() *cobra.Command {
 	var relaunch bool
+	var force bool
 	cmd := &cobra.Command{
 		Use:               "use <name>",
 		Short:             "Switch to a saved account",
@@ -164,25 +168,18 @@ func (a *App) newUseCmd() *cobra.Command {
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("Switched to %s", name)))
 			fmt.Fprintln(cmd.OutOrStdout())
+			if force && !relaunch {
+				return fmt.Errorf("--force requires --relaunch")
+			}
 			if !relaunch {
 				return a.runCurrent(cmd)
 			}
 
-			confirmed, err := confirmOptionalAction(cmd, "Relaunch Codex App now?")
-			if err != nil {
-				return err
-			}
-			if !confirmed {
-				printInfoWarning(cmd.OutOrStdout(), "Skipped Codex App relaunch. Restart the app manually to apply the new account.")
-				fmt.Fprintln(cmd.OutOrStdout())
-				return a.runCurrent(cmd)
-			}
-
-			fmt.Fprintln(cmd.OutOrStdout(), colorize("Relaunching Codex App..."))
-			return relaunchCodexApp()
+			return a.runRelaunch(cmd, force)
 		},
 	}
 	cmd.Flags().BoolVar(&relaunch, "relaunch", false, "Prompt to relaunch Codex App after switching")
+	cmd.Flags().BoolVar(&force, "force", false, "Force Codex App to quit during --relaunch")
 	return cmd
 }
 
@@ -207,6 +204,19 @@ func (a *App) newCurrentCmd() *cobra.Command {
 			return a.runCurrent(cmd)
 		},
 	}
+}
+
+func (a *App) newThreadsCmd() *cobra.Command {
+	var source string
+	cmd := &cobra.Command{
+		Use:   "threads",
+		Short: "List active Codex threads",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return a.runThreads(cmd, source)
+		},
+	}
+	cmd.Flags().StringVar(&source, "source", string(sessions.ThreadSourceLocal), "thread source: local or appserver")
+	return cmd
 }
 
 func (a *App) newSyncCmd() *cobra.Command {
@@ -412,6 +422,27 @@ func (a *App) runList(cmd *cobra.Command, localOnly bool) error {
 		printInfo(cmd.OutOrStdout(), "No saved accounts.")
 		return nil
 	}
+	if !localOnly {
+		if isTTY() {
+			renderer := newStreamingListRenderer(cmd)
+			renderer.Render()
+			accounts.StreamListRows(a.Paths, a.Config, a.Client, false, a.Now(), func(event accounts.ListRowEvent) {
+				renderer.Append(event)
+			})
+			renderer.PrintNotes()
+			return nil
+		}
+		notes := []string{}
+		printStreamingListHeader(cmd.OutOrStdout())
+		accounts.StreamListRows(a.Paths, a.Config, a.Client, false, a.Now(), func(event accounts.ListRowEvent) {
+			printStreamingListRow(cmd.OutOrStdout(), event.Row, event.IsCurrent)
+			if event.Note != "" {
+				notes = append(notes, event.Note)
+			}
+		})
+		printNotes(cmd, notes)
+		return nil
+	}
 	rows := accounts.BuildListRows(a.Paths, a.Config, a.Client, localOnly, a.Now())
 	printListRows(cmd, rows)
 	return nil
@@ -436,6 +467,34 @@ func (a *App) runCurrent(cmd *cobra.Command) error {
 	return nil
 }
 
+func (a *App) runThreads(cmd *cobra.Command, sourceValue string) error {
+	if err := a.ensureConfig(); err != nil {
+		return err
+	}
+
+	source, err := sessions.NormalizeThreadSource(sourceValue)
+	if err != nil {
+		return err
+	}
+	codexBin := ""
+	if source == sessions.ThreadSourceAppServer {
+		codexBin = resolveCodexBin(a.Config)
+	}
+
+	activeThreads, err := sessions.ListActiveThreadsWithSource(a.Paths, a.Now(), source, codexBin)
+	if err != nil {
+		return err
+	}
+	if len(activeThreads) == 0 {
+		printInfo(cmd.OutOrStdout(), fmt.Sprintf("No active Codex threads from %s.", source))
+		return nil
+	}
+
+	printHeadline(cmd.OutOrStdout(), fmt.Sprintf("Active threads (%s)", source))
+	printActiveThreads(cmd.OutOrStdout(), activeThreads)
+	return nil
+}
+
 func (a *App) runSync(cmd *cobra.Command, scope string, force bool) error {
 	if err := a.ensureConfig(); err != nil {
 		return err
@@ -446,37 +505,61 @@ func (a *App) runSync(cmd *cobra.Command, scope string, force bool) error {
 	checkedNames := []string{}
 
 	if scope == "all" {
+		var syncRenderer *syncProgressRenderer
+		currentLabel := accountLabelFromPath("current", a.Paths.AuthFile, now)
+		if isTTY() {
+			fmt.Fprintln(cmd.OutOrStdout())
+			printSectionHeader(cmd.OutOrStdout(), "Sync Progress")
+			syncRenderer = newSyncProgressRenderer(cmd)
+			syncRenderer.Render()
+		} else {
+			fmt.Fprintln(cmd.OutOrStdout())
+			printSectionHeader(cmd.OutOrStdout(), "Sync Progress")
+			printSyncProgressHeader(cmd.OutOrStdout())
+		}
+
 		if refreshed, err := auth.RefreshAuthFileIfNeeded(a.Client, a.Config, a.Paths.AuthFile, force, now); err == nil && refreshed {
 			refreshedNames = append(refreshedNames, "current")
+			emitSyncProgress(cmd.OutOrStdout(), syncRenderer, currentLabel, "refreshed", "token updated", ansiFeatureSuccessStyle)
 		} else if err != nil {
 			refreshNotes = append(refreshNotes, err.Error())
+			emitSyncProgress(cmd.OutOrStdout(), syncRenderer, currentLabel, "failed", err.Error(), ansiFeatureWarningStyle)
+		} else {
+			emitSyncProgress(cmd.OutOrStdout(), syncRenderer, currentLabel, "skipped", "already up to date", ansiFeatureInfoStyle)
 		}
 
 		currentAlias := accounts.DetectCurrentAccountName(a.Paths)
 		currentID := accounts.AccountIDFromFile(a.Paths.AuthFile)
-		for _, name := range accounts.ListAccountNames(a.Paths) {
-			path := filepath.Join(a.Paths.AccountsDir, name+".json")
-			if name == currentAlias {
+		results := a.refreshSavedAliasesAsync(currentAlias, currentID, force, now)
+		for _, result := range results {
+			if result.err != nil {
+				refreshNotes = append(refreshNotes, fmt.Sprintf("%s: %v", result.name, result.err))
+				emitSyncProgress(cmd.OutOrStdout(), syncRenderer, result.label, "failed", result.err.Error(), ansiFeatureWarningStyle)
 				continue
 			}
-			if currentID != "" && accounts.AccountIDFromFile(path) == currentID {
+			checkedNames = append(checkedNames, result.name)
+			if result.refreshed {
+				refreshedNames = append(refreshedNames, result.name)
+				emitSyncProgress(cmd.OutOrStdout(), syncRenderer, result.label, "refreshed", "token updated", ansiFeatureSuccessStyle)
 				continue
 			}
-			refreshed, err := auth.RefreshAuthFileIfNeeded(a.Client, a.Config, path, force, now)
-			if err != nil {
-				refreshNotes = append(refreshNotes, fmt.Sprintf("%s: %v", name, err))
-				continue
-			}
-			checkedNames = append(checkedNames, name)
-			if refreshed {
-				refreshedNames = append(refreshedNames, name)
-			}
+			emitSyncProgress(cmd.OutOrStdout(), syncRenderer, result.label, "skipped", "already up to date", ansiFeatureInfoStyle)
+		}
+
+		if syncRenderer != nil {
+			fmt.Fprintln(cmd.OutOrStdout())
 		}
 
 		updated, checked, warnings := accounts.SyncSavedAliases(a.Paths)
 		checkedNames = append(checkedNames, checked...)
-		if err := printWarningsOrSummary(cmd, warnings, refreshNotes, refreshedNames, updated, force); err != nil {
-			return err
+		if len(warnings) > 0 {
+			for _, warning := range warnings {
+				printInfoWarning(cmd.OutOrStdout(), warning)
+			}
+		} else if len(refreshNotes) == 0 {
+			if err := printSummaryOnly(cmd, refreshedNames, updated, force); err != nil {
+				return err
+			}
 		}
 		if err := accounts.RecordLastChecked(a.Paths, checkedNames, now); err != nil {
 			printInfoWarning(cmd.OutOrStdout(), fmt.Sprintf("last-checked update skipped: %v", err))
@@ -503,6 +586,83 @@ func (a *App) runSync(cmd *cobra.Command, scope string, force bool) error {
 	return a.runCurrent(cmd)
 }
 
+type aliasRefreshResult struct {
+	name      string
+	label     string
+	refreshed bool
+	err       error
+}
+
+func (a *App) refreshSavedAliasesAsync(currentAlias, currentID string, force bool, now time.Time) []aliasRefreshResult {
+	type aliasRefreshJob struct {
+		name  string
+		label string
+		path  string
+	}
+
+	jobsList := []aliasRefreshJob{}
+	for _, name := range accounts.ListAccountNames(a.Paths) {
+		path := filepath.Join(a.Paths.AccountsDir, name+".json")
+		if name == currentAlias {
+			continue
+		}
+		if currentID != "" && accounts.AccountIDFromFile(path) == currentID {
+			continue
+		}
+		jobsList = append(jobsList, aliasRefreshJob{
+			name:  name,
+			label: accountLabelFromPath(name, path, now),
+			path:  path,
+		})
+	}
+	if len(jobsList) == 0 {
+		return nil
+	}
+
+	workers := a.Config.Network.MaxUsageWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(jobsList) {
+		workers = len(jobsList)
+	}
+
+	jobs := make(chan aliasRefreshJob)
+	results := make(chan aliasRefreshResult)
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				refreshed, err := auth.RefreshAuthFileIfNeeded(a.Client, a.Config, job.path, force, now)
+				results <- aliasRefreshResult{
+					name:      job.name,
+					label:     job.label,
+					refreshed: refreshed,
+					err:       err,
+				}
+			}
+		}()
+	}
+
+	go func() {
+		for _, job := range jobsList {
+			jobs <- job
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	collected := make([]aliasRefreshResult, 0, len(jobsList))
+	for result := range results {
+		collected = append(collected, result)
+	}
+	return collected
+}
+
 func (a *App) runDoctor(cmd *cobra.Command) error {
 	if err := a.ensureConfig(); err != nil {
 		return err
@@ -524,31 +684,113 @@ func (a *App) runDoctor(cmd *cobra.Command) error {
 	}
 
 	fmt.Fprintln(cmd.OutOrStdout())
-	detailRows := [][]string{}
-	notes := []string{}
-	for _, name := range files {
-		path := filepath.Join(a.Paths.AccountsDir, name+".json")
-		snapshot, err := accounts.ReadSnapshot(path, a.Now())
-		if err != nil {
-			detailRows = append(detailRows, []string{name, "bad", "no", "no", "read failed"})
-			notes = append(notes, fmt.Sprintf("%s: %v", name, err))
-			continue
-		}
-
-		liveUsage, usageErr := usage.Fetch(a.Client, a.Config, snapshot.Tokens["access_token"])
-		live := "fail"
-		if usageErr == nil && liveUsage != nil {
-			live = "ok"
-		}
-		detailRows = append(detailRows, []string{name, "ok", yesNo(snapshot.AccountID != ""), yesNo(snapshot.Tokens["access_token"] != ""), live})
-		if usageErr != nil {
-			notes = append(notes, fmt.Sprintf("%s: live usage check failed: %v", name, usageErr))
-		}
+	printSectionHeader(cmd.OutOrStdout(), "Saved Account Health")
+	if isTTY() {
+		renderer := newDoctorDetailRenderer(cmd)
+		renderer.Render()
+		a.streamDoctorDetails(func(result doctorDetailResult) {
+			renderer.Append(result)
+		})
+		renderer.PrintNotes()
+		return nil
 	}
 
-	printTable(cmd.OutOrStdout(), []string{"ACCOUNT", "JSON", "ACCOUNT ID", "ACCESS TOKEN", "LIVE USAGE"}, detailRows)
+	notes := []string{}
+	printDoctorDetailHeader(cmd.OutOrStdout())
+	a.streamDoctorDetails(func(result doctorDetailResult) {
+		printDoctorDetailRow(cmd.OutOrStdout(), result.Row)
+		if result.Note != "" {
+			notes = append(notes, result.Note)
+		}
+	})
 	printNotes(cmd, notes)
 	return nil
+}
+
+type doctorDetailResult struct {
+	Row  []string
+	Note string
+}
+
+func (a *App) streamDoctorDetails(emit func(doctorDetailResult)) {
+	type doctorJob struct {
+		name string
+		path string
+	}
+
+	files := accounts.ListAccountNames(a.Paths)
+	if len(files) == 0 {
+		return
+	}
+
+	jobsList := make([]doctorJob, 0, len(files))
+	for _, name := range files {
+		jobsList = append(jobsList, doctorJob{
+			name: name,
+			path: filepath.Join(a.Paths.AccountsDir, name+".json"),
+		})
+	}
+
+	workers := a.Config.Network.MaxUsageWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	if workers > len(jobsList) {
+		workers = len(jobsList)
+	}
+
+	jobs := make(chan doctorJob)
+	results := make(chan doctorDetailResult)
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				snapshot, err := accounts.ReadSnapshot(job.path, a.Now())
+				if err != nil {
+					results <- doctorDetailResult{
+						Row:  []string{job.name, "bad", "no", "no", "read failed"},
+						Note: fmt.Sprintf("%s: %v", job.name, err),
+					}
+					continue
+				}
+
+				liveUsage, usageErr := usage.Fetch(a.Client, a.Config, snapshot.Tokens["access_token"])
+				live := "fail"
+				if usageErr == nil && liveUsage != nil {
+					live = "ok"
+				}
+				result := doctorDetailResult{
+					Row: []string{
+						formatAccountLabel(job.name, snapshot.Email),
+						"ok",
+						yesNo(snapshot.AccountID != ""),
+						yesNo(snapshot.Tokens["access_token"] != ""),
+						live,
+					},
+				}
+				if usageErr != nil {
+					result.Note = fmt.Sprintf("%s: live usage check failed: %v", job.name, usageErr)
+				}
+				results <- result
+			}
+		}()
+	}
+
+	go func() {
+		for _, job := range jobsList {
+			jobs <- job
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		emit(result)
+	}
 }
 
 func (a *App) runPrune(cmd *cobra.Command, apply bool, assumeYes bool) error {
@@ -657,6 +899,45 @@ func (a *App) runInstallCompletion(cmd *cobra.Command, shell string) error {
 	default:
 		return fmt.Errorf("unsupported shell %q", shell)
 	}
+}
+
+func (a *App) runRelaunch(cmd *cobra.Command, force bool) error {
+	activeThreads, err := sessions.ListActiveThreads(a.Paths, a.Now())
+	if err != nil {
+		printInfoWarning(cmd.OutOrStdout(), fmt.Sprintf("Unable to inspect active Codex threads: %v", err))
+		fmt.Fprintln(cmd.OutOrStdout())
+		activeThreads = nil
+	}
+
+	confirmed, err := confirmOptionalAction(cmd, "Relaunch Codex App now?")
+	if err != nil {
+		return err
+	}
+	if !confirmed {
+		printInfoWarning(cmd.OutOrStdout(), "Skipped Codex App relaunch. Restart the app manually to apply the new account.")
+		fmt.Fprintln(cmd.OutOrStdout())
+		return a.runCurrent(cmd)
+	}
+
+	if len(activeThreads) > 0 {
+		printInfoWarning(cmd.OutOrStdout(), fmt.Sprintf("Detected %d active Codex thread(s). Relaunching now may interrupt them.", len(activeThreads)))
+		fmt.Fprintln(cmd.OutOrStdout())
+		printActiveThreads(cmd.OutOrStdout(), activeThreads)
+		fmt.Fprintln(cmd.OutOrStdout())
+
+		confirmed, err = confirmOptionalAction(cmd, "Relaunch anyway?")
+		if err != nil {
+			return err
+		}
+		if !confirmed {
+			printInfoWarning(cmd.OutOrStdout(), "Skipped Codex App relaunch to avoid interrupting active threads.")
+			fmt.Fprintln(cmd.OutOrStdout())
+			return a.runCurrent(cmd)
+		}
+	}
+
+	fmt.Fprintln(cmd.OutOrStdout(), colorize("Relaunching Codex App..."))
+	return relaunchCodexApp(force)
 }
 
 func (a *App) showNamedRows(cmd *cobra.Command, names []string, localOnly bool) error {
@@ -788,6 +1069,67 @@ func printWarningsOrSummary(cmd *cobra.Command, warnings, refreshNotes, refreshe
 	return nil
 }
 
+func printSummaryOnly(cmd *cobra.Command, refreshedNames, updated []string, force bool) error {
+	if len(refreshedNames) > 0 {
+		prefix := "Refreshed"
+		if force {
+			prefix = "Force refreshed"
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("%s: %s", prefix, strings.Join(refreshedNames, ", "))))
+	}
+	if len(updated) > 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("Synced aliases: %s", strings.Join(updated, ", "))))
+	}
+	if len(refreshedNames) == 0 && len(updated) == 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), colorize("Already up to date"))
+	}
+	fmt.Fprintln(cmd.OutOrStdout())
+	return nil
+}
+
+func emitSyncProgress(writer io.Writer, renderer *syncProgressRenderer, account, status, detail, style string) {
+	if renderer != nil {
+		renderer.Append([]string{account, status, detail}, style)
+		return
+	}
+	printSyncProgressRow(writer, []string{account, status, detail}, style)
+}
+
+func printSyncProgressHeader(writer io.Writer) {
+	fmt.Fprintln(writer, colorizeWithStyle(formatSyncProgressLine("ACCOUNT", "STATUS", "DETAIL"), ansiListHeaderStyle))
+}
+
+func printSyncProgressRow(writer io.Writer, row []string, style string) {
+	if len(row) < 3 {
+		return
+	}
+	fmt.Fprintln(writer, colorizeWithStyle(formatSyncProgressLine(row[0], row[1], row[2]), style))
+}
+
+func formatSyncProgressLine(account, status, detail string) string {
+	cells := []string{
+		padRight(account, 32),
+		padRight(status, 10),
+		detail,
+	}
+	return strings.TrimRight(strings.Join(cells, "  "), " ")
+}
+
+func accountLabelFromPath(name, path string, now time.Time) string {
+	snapshot, err := accounts.ReadSnapshot(path, now)
+	if err != nil {
+		return name
+	}
+	return formatAccountLabel(name, snapshot.Email)
+}
+
+func formatAccountLabel(name, email string) string {
+	if strings.TrimSpace(email) == "" || strings.TrimSpace(email) == "-" {
+		return name
+	}
+	return fmt.Sprintf("%s <%s>", name, email)
+}
+
 func filterStartupWarnings(warnings []string) []string {
 	filtered := make([]string, 0, len(warnings))
 	for _, warning := range warnings {
@@ -819,8 +1161,7 @@ func confirmAction(cmd *cobra.Command, assumeYes bool, prompt string) error {
 func confirmOptionalAction(cmd *cobra.Command, prompt string) (bool, error) {
 	input := cmd.InOrStdin()
 	fmt.Fprintf(cmd.OutOrStdout(), "%s %s ", colorizeWithStyle(prompt, ansiFeatureWarningStyle), colorizeWithStyle("[y/N]", ansiFeatureLabelStyle))
-	reader := bufio.NewReader(input)
-	reply, err := reader.ReadString('\n')
+	reply, err := readConfirmationLine(input)
 	if err != nil && len(reply) == 0 {
 		if file, ok := input.(*os.File); ok {
 			if info, statErr := file.Stat(); statErr == nil && info.Mode()&os.ModeCharDevice == 0 {
@@ -834,6 +1175,26 @@ func confirmOptionalAction(cmd *cobra.Command, prompt string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func readConfirmationLine(reader io.Reader) (string, error) {
+	var builder strings.Builder
+	buffer := make([]byte, 1)
+	for {
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			builder.WriteByte(buffer[0])
+			if buffer[0] == '\n' {
+				return builder.String(), nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF && builder.Len() > 0 {
+				return builder.String(), err
+			}
+			return builder.String(), err
+		}
+	}
 }
 
 func filterCurrentRows(rows accounts.ListRowsResult) accounts.ListRowsResult {
@@ -861,6 +1222,11 @@ func filterCurrentRows(rows accounts.ListRowsResult) accounts.ListRowsResult {
 }
 
 func printListRows(cmd *cobra.Command, result accounts.ListRowsResult) {
+	printListRowsWithoutNotes(cmd, result)
+	printNotes(cmd, result.Notes)
+}
+
+func printListRowsWithoutNotes(cmd *cobra.Command, result accounts.ListRowsResult) {
 	rows := make([][]string, 0, len(result.Rows))
 	rowStyles := make([][]string, 0, len(result.Rows))
 	for index, row := range result.Rows {
@@ -878,7 +1244,197 @@ func printListRows(cmd *cobra.Command, result accounts.ListRowsResult) {
 		rowStyles,
 		ansiListHeaderStyle,
 	)
-	printNotes(cmd, result.Notes)
+}
+
+func printStreamingListHeader(writer io.Writer) {
+	line := formatStreamingListLine("", "READY", "ACCOUNT", "PLAN", "5H USAGE", "WEEKLY USAGE", "LAST CHECKED")
+	fmt.Fprintln(writer, colorizeWithStyle(line, ansiListHeaderStyle))
+}
+
+func printStreamingListRow(writer io.Writer, row accounts.ListRow, isCurrent bool) {
+	style := ansiListRowStyle
+	if isCurrent {
+		style = ansiListCurrentRowStyle
+	}
+	line := formatStreamingListLine(row.Marker, row.Ready, row.Account, row.Plan, row.FiveHour, row.Weekly, row.LastChecked)
+	fmt.Fprintln(writer, colorizeWithStyle(line, style))
+}
+
+func formatStreamingListLine(marker, ready, account, plan, fiveHour, weekly, lastChecked string) string {
+	cells := []string{
+		padRight(marker, 1),
+		padRight(ready, 5),
+		padRight(account, 32),
+		padRight(plan, 24),
+		padRight(fiveHour, 18),
+		padRight(weekly, 20),
+		lastChecked,
+	}
+	return strings.TrimRight(strings.Join(cells, " "), " ")
+}
+
+type streamingListRenderer struct {
+	cmd           *cobra.Command
+	result        accounts.ListRowsResult
+	renderedLines int
+}
+
+func newStreamingListRenderer(cmd *cobra.Command) *streamingListRenderer {
+	return &streamingListRenderer{
+		cmd: cmd,
+		result: accounts.ListRowsResult{
+			Rows:           []accounts.ListRow{},
+			CurrentIndices: map[int]struct{}{},
+			Notes:          []string{},
+		},
+	}
+}
+
+func (r *streamingListRenderer) Append(event accounts.ListRowEvent) {
+	r.result.Rows = append(r.result.Rows, event.Row)
+	if event.IsCurrent {
+		r.result.CurrentIndices[len(r.result.Rows)-1] = struct{}{}
+	}
+	if event.Note != "" {
+		r.result.Notes = append(r.result.Notes, event.Note)
+	}
+	r.Render()
+}
+
+func (r *streamingListRenderer) Render() {
+	if r.renderedLines > 0 {
+		fmt.Fprintf(r.cmd.OutOrStdout(), "\033[%dA\033[J", r.renderedLines)
+	}
+	printListRowsWithoutNotes(r.cmd, r.result)
+	r.renderedLines = 1 + len(r.result.Rows)
+}
+
+func (r *streamingListRenderer) PrintNotes() {
+	printNotes(r.cmd, r.result.Notes)
+}
+
+func printDoctorDetailRowsWithoutNotes(cmd *cobra.Command, rows [][]string) {
+	printTable(cmd.OutOrStdout(), []string{"ACCOUNT", "JSON", "ACCOUNT ID", "ACCESS TOKEN", "LIVE USAGE"}, rows)
+}
+
+func printDoctorDetailHeader(writer io.Writer) {
+	line := formatDoctorDetailLine("ACCOUNT", "JSON", "ACCOUNT ID", "ACCESS TOKEN", "LIVE USAGE")
+	fmt.Fprintln(writer, colorizeWithStyle(line, ansiListHeaderStyle))
+}
+
+func printDoctorDetailRow(writer io.Writer, row []string) {
+	if len(row) < 5 {
+		return
+	}
+	line := formatDoctorDetailLine(row[0], row[1], row[2], row[3], row[4])
+	fmt.Fprintln(writer, colorizeWithStyle(line, ansiListRowStyle))
+}
+
+func formatDoctorDetailLine(account, jsonStatus, accountID, accessToken, liveUsage string) string {
+	cells := []string{
+		padRight(account, 16),
+		padRight(jsonStatus, 4),
+		padRight(accountID, 10),
+		padRight(accessToken, 12),
+		liveUsage,
+	}
+	return strings.TrimRight(strings.Join(cells, "  "), " ")
+}
+
+type doctorDetailRenderer struct {
+	cmd           *cobra.Command
+	rows          [][]string
+	notes         []string
+	renderedLines int
+}
+
+func newDoctorDetailRenderer(cmd *cobra.Command) *doctorDetailRenderer {
+	return &doctorDetailRenderer{
+		cmd:   cmd,
+		rows:  [][]string{},
+		notes: []string{},
+	}
+}
+
+func (r *doctorDetailRenderer) Append(result doctorDetailResult) {
+	r.rows = append(r.rows, result.Row)
+	if result.Note != "" {
+		r.notes = append(r.notes, result.Note)
+	}
+	r.Render()
+}
+
+func (r *doctorDetailRenderer) Render() {
+	if r.renderedLines > 0 {
+		fmt.Fprintf(r.cmd.OutOrStdout(), "\033[%dA\033[J", r.renderedLines)
+	}
+	printDoctorDetailRowsWithoutNotes(r.cmd, r.rows)
+	r.renderedLines = 1 + len(r.rows)
+}
+
+func (r *doctorDetailRenderer) PrintNotes() {
+	printNotes(r.cmd, r.notes)
+}
+
+type syncProgressRenderer struct {
+	cmd           *cobra.Command
+	rows          [][]string
+	styles        []string
+	renderedLines int
+}
+
+func newSyncProgressRenderer(cmd *cobra.Command) *syncProgressRenderer {
+	return &syncProgressRenderer{
+		cmd:    cmd,
+		rows:   [][]string{},
+		styles: []string{},
+	}
+}
+
+func (r *syncProgressRenderer) Append(row []string, style string) {
+	r.rows = append(r.rows, row)
+	r.styles = append(r.styles, style)
+	r.Render()
+}
+
+func (r *syncProgressRenderer) Render() {
+	if r.renderedLines > 0 {
+		fmt.Fprintf(r.cmd.OutOrStdout(), "\033[%dA\033[J", r.renderedLines)
+	}
+	printColorTable(
+		r.cmd.OutOrStdout(),
+		[]string{"ACCOUNT", "STATUS", "DETAIL"},
+		r.rows,
+		r.syncCellStyles(),
+		ansiListHeaderStyle,
+	)
+	r.renderedLines = 1 + len(r.rows)
+}
+
+func (r *syncProgressRenderer) syncCellStyles() [][]string {
+	cellStyles := make([][]string, 0, len(r.rows))
+	for index := range r.rows {
+		style := ansiListRowStyle
+		if index < len(r.styles) && strings.TrimSpace(r.styles[index]) != "" {
+			style = r.styles[index]
+		}
+		cellStyles = append(cellStyles, []string{style, style, style})
+	}
+	return cellStyles
+}
+
+func printActiveThreads(writer interface{ Write([]byte) (int, error) }, activeThreads []sessions.ActiveThread) {
+	rows := make([][]string, 0, len(activeThreads))
+	for _, thread := range activeThreads {
+		rows = append(rows, []string{
+			sessions.FormatThreadLabel(thread),
+			fallback(strings.TrimSpace(thread.Status), "-"),
+			support.FormatISO8601(formatTime(thread.LastActiveAt)),
+			support.FormatISO8601(formatTime(thread.LastTaskStartedAt)),
+			thread.SessionID,
+		})
+	}
+	printTable(writer, []string{"THREAD", "STATUS", "LAST ACTIVE", "TURN STARTED", "SESSION ID"}, rows)
 }
 
 func lifetime(token string) string {
@@ -930,6 +1486,13 @@ func boolStatus(value bool, truthy, falsy string) string {
 
 func colorize(text string) string {
 	return colorizeWithStyle(text, ansiFeatureSuccessStyle)
+}
+
+func formatTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.Format(time.RFC3339Nano)
 }
 
 const (

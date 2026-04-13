@@ -18,6 +18,9 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if cfg.Refresh.Margin != DefaultRefreshMargin {
 		t.Fatalf("expected default margin %q, got %q", DefaultRefreshMargin, cfg.Refresh.Margin)
 	}
+	if cfg.Network.SubscriptionURL != DefaultSubscriptionURL {
+		t.Fatalf("expected default subscription url %q, got %q", DefaultSubscriptionURL, cfg.Network.SubscriptionURL)
+	}
 	if cfg.Network.RefreshClientID != "" {
 		t.Fatalf("expected empty default refresh client id, got %q", cfg.Network.RefreshClientID)
 	}
@@ -44,6 +47,7 @@ func TestLoadMigratesFlatConfig(t *testing.T) {
   "usage_timeout_seconds": 11,
   "max_usage_workers": 3,
   "wham_usage_url": "https://example.com/usage",
+  "subscription_url": "https://example.com/subscription",
   "refresh_url": "https://example.com/refresh",
   "refresh_client_id": "client-123",
   "refresh_timeout_seconds": 14
@@ -59,7 +63,7 @@ func TestLoadMigratesFlatConfig(t *testing.T) {
 	if cfg.CodexBin != "/tmp/codex" || cfg.Refresh.Margin != "2d" {
 		t.Fatalf("unexpected migrated config: %+v", cfg)
 	}
-	if cfg.Network.UsageURL != "https://example.com/usage" || cfg.Network.RefreshClientID != "client-123" {
+	if cfg.Network.UsageURL != "https://example.com/usage" || cfg.Network.SubscriptionURL != "https://example.com/subscription" || cfg.Network.RefreshClientID != "client-123" {
 		t.Fatalf("unexpected network config: %+v", cfg.Network)
 	}
 }

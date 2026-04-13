@@ -15,6 +15,7 @@ import (
 
 	"codex-switch/internal/auth"
 	"codex-switch/internal/config"
+	"codex-switch/internal/subscription"
 	"codex-switch/internal/support"
 	"codex-switch/internal/usage"
 )
@@ -44,6 +45,12 @@ type ListRowsResult struct {
 	Rows           []ListRow
 	CurrentIndices map[int]struct{}
 	Notes          []string
+}
+
+type ListRowEvent struct {
+	Row       ListRow
+	IsCurrent bool
+	Note      string
 }
 
 type PrunePair struct {
@@ -79,43 +86,66 @@ func ListAccountNames(paths config.Paths) []string {
 func DetectCurrentAccountName(paths config.Paths) string {
 	files := listAccountFiles(paths)
 	if _, err := os.Stat(paths.AuthFile); err != nil {
+		debugCurrentAccount("auth file missing: %s", paths.AuthFile)
 		return ""
 	}
 
 	meta := loadSyncMeta(paths)
+	debugCurrentAccount("start auth=%s current_alias=%q saved_files=%d", paths.AuthFile, meta.CurrentAlias, len(files))
 	if meta.CurrentAlias != "" {
-		currentPath := filepath.Join(paths.AccountsDir, meta.CurrentAlias+".json")
-		if _, err := os.Stat(currentPath); err == nil {
+		currentPath, aliasName, ok := resolveAccountPathByName(paths, meta.CurrentAlias)
+		if ok {
 			same, sameErr := sameFile(currentPath, paths.AuthFile)
 			if sameErr == nil && same {
-				return meta.CurrentAlias
+				debugCurrentAccount("matched current_alias=%q by identical file content -> alias=%q", meta.CurrentAlias, aliasName)
+				return aliasName
+			}
+			if sameErr != nil {
+				debugCurrentAccount("current_alias=%q sameFile error: %v", meta.CurrentAlias, sameErr)
+			} else {
+				debugCurrentAccount("current_alias=%q sameFile=false", meta.CurrentAlias)
 			}
 
 			currentID := AccountIDFromFile(paths.AuthFile)
-			if currentID != "" && AccountIDFromFile(currentPath) == currentID {
-				return meta.CurrentAlias
+			aliasID := AccountIDFromFile(currentPath)
+			debugCurrentAccount("current_alias=%q auth_account_id=%q alias_account_id=%q", meta.CurrentAlias, currentID, aliasID)
+			if currentID != "" && aliasID == currentID {
+				debugCurrentAccount("matched current_alias=%q by account_id -> alias=%q", meta.CurrentAlias, aliasName)
+				return aliasName
 			}
+		} else {
+			debugCurrentAccount("current_alias=%q file missing", meta.CurrentAlias)
 		}
 	}
 
 	for _, path := range files {
 		same, err := sameFile(path, paths.AuthFile)
 		if err == nil && same {
+			debugCurrentAccount("matched alias=%q by identical file content", stem(path))
 			return stem(path)
+		}
+		if err != nil {
+			debugCurrentAccount("sameFile error alias=%q: %v", stem(path), err)
 		}
 	}
 
 	currentID := AccountIDFromFile(paths.AuthFile)
 	if currentID == "" {
+		debugCurrentAccount("auth account_id missing; no alias match")
 		return ""
 	}
+	debugCurrentAccount("falling back to account_id matching auth_account_id=%q", currentID)
 
 	for _, path := range files {
-		if AccountIDFromFile(path) == currentID {
+		aliasID := AccountIDFromFile(path)
+		debugCurrentAccount("compare alias=%q alias_account_id=%q auth_account_id=%q", stem(path), aliasID, currentID)
+		if aliasID == currentID {
+			debugCurrentAccount("matched alias=%q by account_id", stem(path))
 			return stem(path)
 		}
 	}
 
+	debugCurrentAccount("no current alias matched")
 	return ""
 }
 
@@ -145,102 +175,133 @@ func ReadSnapshot(path string, now time.Time) (*Snapshot, error) {
 }
 
 func BuildListRows(paths config.Paths, cfg config.Config, client *http.Client, localOnly bool, now time.Time) ListRowsResult {
-	files := listAccountFiles(paths)
-	currentName := DetectCurrentAccountName(paths)
-	meta := loadSyncMeta(paths)
-
+	prepared := prepareListRows(paths, now)
 	result := ListRowsResult{
 		Rows:           []ListRow{},
 		CurrentIndices: map[int]struct{}{},
 		Notes:          []string{},
 	}
 
-	snapshots := map[string]*Snapshot{}
-	for _, path := range files {
-		snapshot, err := ReadSnapshot(path, now)
-		if err != nil {
-			lastChecked := support.FormatRelativeAge(support.ParseISOToTime(meta.LastChecked[stem(path)]), now)
-			result.Rows = append(result.Rows, ListRow{
-				Marker:      " ",
-				Ready:       "UNK",
-				Account:     stem(path),
-				Plan:        "-",
-				FiveHour:    "unavailable (-)",
-				Weekly:      "unavailable (-)",
-				LastChecked: lastChecked,
-			})
-			result.Notes = append(result.Notes, fmt.Sprintf("%s: read failed: %v", stem(path), err))
+	for _, item := range prepared.items {
+		if item.event == nil {
 			continue
 		}
-		snapshots[snapshot.Name] = snapshot
+		appendListRowEvent(&result, *item.event)
+	}
+
+	snapshots := map[string]*Snapshot{}
+	for _, item := range prepared.items {
+		if item.snapshot == nil {
+			continue
+		}
+		snapshots[item.snapshot.Name] = item.snapshot
 	}
 
 	usageByToken := map[string]usageResult{}
+	subscriptionByAccount := map[string]subscriptionResult{}
 	if !localOnly {
 		usageByToken = fetchUsageConcurrently(cfg, client, snapshots)
+		subscriptionByAccount = fetchSubscriptionsConcurrently(cfg, client, snapshots)
 	}
 
-	for _, path := range files {
-		snapshot := snapshots[stem(path)]
-		if snapshot == nil {
+	for _, item := range prepared.items {
+		if item.snapshot == nil {
 			continue
 		}
 
-		row := ListRow{
-			Marker:   " ",
-			Account:  fmt.Sprintf("%s <%s>", snapshot.Name, snapshot.Email),
-			Plan:     snapshot.Plan,
-			FiveHour: "local only (-)",
-			Weekly:   "local only (-)",
-			Ready:    "UNK",
+		fetched := usageResult{}
+		subscriptionFetched := subscriptionResult{}
+		if !localOnly {
+			fetched = usageResultForSnapshot(usageByToken, item.snapshot)
+			subscriptionFetched = subscriptionResultForSnapshot(subscriptionByAccount, item.snapshot)
 		}
-
-		if snapshot.Name == currentName {
-			row.Marker = "*"
-		}
-
-		if localOnly {
-			row.FiveHour = "local only (-)"
-			row.Weekly = "local only (-)"
-		} else {
-			token := snapshot.Tokens["access_token"]
-			fetched := usageByToken[token]
-			if fetched.data != nil {
-				if email, ok := fetched.data["email"].(string); ok && email != "" {
-					row.Account = fmt.Sprintf("%s <%s>", snapshot.Name, email)
-				}
-				if plan, ok := fetched.data["plan_type"].(string); ok && plan != "" {
-					row.Plan = plan
-				}
-				rateLimit, _ := fetched.data["rate_limit"].(map[string]any)
-				if allowed, ok := rateLimit["allowed"].(bool); ok && allowed {
-					row.Ready = "YES"
-				} else {
-					row.Ready = "NO"
-				}
-				fiveHour, resetFiveHour, weekly, resetWeekly := usage.SummarizeRateLimit(rateLimit, now)
-				row.FiveHour = fmt.Sprintf("%s (%s)", fiveHour, resetFiveHour)
-				row.Weekly = fmt.Sprintf("%s (%s)", weekly, resetWeekly)
-			} else {
-				row.Ready = "UNK"
-				row.FiveHour = fmt.Sprintf("unavailable (%s)", snapshot.TokenExpiry)
-				row.Weekly = "unavailable (-)"
-				result.Notes = append(result.Notes, fmt.Sprintf("%s: usage lookup failed: %v", snapshot.Name, fetched.err))
-			}
-		}
-
-		lastCheckedTime := snapshot.LastRefreshTime
-		if lastCheckedTime == nil {
-			lastCheckedTime = support.ParseISOToTime(meta.LastChecked[snapshot.Name])
-		}
-		row.LastChecked = support.FormatRelativeAge(lastCheckedTime, now)
-		result.Rows = append(result.Rows, row)
-		if snapshot.Name == currentName {
-			result.CurrentIndices[len(result.Rows)-1] = struct{}{}
-		}
+		appendListRowEvent(&result, buildListRowEvent(item.snapshot, prepared.currentName, prepared.meta, localOnly, now, fetched, subscriptionFetched))
 	}
 
 	return result
+}
+
+func StreamListRows(paths config.Paths, cfg config.Config, client *http.Client, localOnly bool, now time.Time, emit func(ListRowEvent)) {
+	prepared := prepareListRows(paths, now)
+	for _, item := range prepared.items {
+		if item.event != nil {
+			emit(*item.event)
+		}
+	}
+
+	if localOnly {
+		for _, item := range prepared.items {
+			if item.snapshot == nil {
+				continue
+			}
+			emit(buildListRowEvent(item.snapshot, prepared.currentName, prepared.meta, true, now, usageResult{}, subscriptionResult{}))
+		}
+		return
+	}
+
+	snapshots := []*Snapshot{}
+	for _, item := range prepared.items {
+		if item.snapshot == nil {
+			continue
+		}
+		token := strings.TrimSpace(item.snapshot.Tokens["access_token"])
+		if token == "" {
+			emit(buildListRowEvent(item.snapshot, prepared.currentName, prepared.meta, false, now, usageResult{err: fmt.Errorf("missing access_token")}, subscriptionResult{err: fmt.Errorf("missing access_token")}))
+			continue
+		}
+		snapshots = append(snapshots, item.snapshot)
+	}
+
+	if len(snapshots) == 0 {
+		return
+	}
+
+	workers := cfg.Network.MaxUsageWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+
+	type fetchResult struct {
+		snapshot *Snapshot
+		usage    usageResult
+		sub      subscriptionResult
+	}
+
+	jobs := make(chan *Snapshot)
+	results := make(chan fetchResult)
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for snapshot := range jobs {
+				usageData, usageErr := usage.Fetch(client, cfg, snapshot.Tokens["access_token"])
+				subscriptionData, subscriptionErr := subscription.Fetch(client, cfg, snapshot.Tokens["access_token"], snapshot.AccountID)
+				results <- fetchResult{
+					snapshot: snapshot,
+					usage:    usageResult{data: usageData, err: usageErr},
+					sub:      subscriptionResult{data: subscriptionData, err: subscriptionErr},
+				}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	go func() {
+		for _, snapshot := range snapshots {
+			jobs <- snapshot
+		}
+		close(jobs)
+	}()
+
+	for fetched := range results {
+		emit(buildListRowEvent(fetched.snapshot, prepared.currentName, prepared.meta, false, now, fetched.usage, fetched.sub))
+	}
 }
 
 func SyncSavedAliases(paths config.Paths) ([]string, []string, []string) {
@@ -298,6 +359,10 @@ func Save(paths config.Paths, name string, force bool) error {
 	if _, err := os.Stat(target); err == nil && !force {
 		return fmt.Errorf("Account already exists: %s\nUse --force to overwrite it.", name)
 	}
+	if existingPath, existingAlias, ok := resolveAccountPathByName(paths, name); ok {
+		target = existingPath
+		name = existingAlias
+	}
 
 	if err := copyFile(paths.AuthFile, target); err != nil {
 		return err
@@ -310,15 +375,15 @@ func Use(paths config.Paths, name string) error {
 		return err
 	}
 
-	source := filepath.Join(paths.AccountsDir, name+".json")
-	if _, err := os.Stat(source); err != nil {
+	source, aliasName, ok := resolveAccountPathByName(paths, name)
+	if !ok {
 		return fmt.Errorf("Account does not exist.")
 	}
 
 	if err := copyFile(source, paths.AuthFile); err != nil {
 		return err
 	}
-	return SetCurrentAlias(paths, name)
+	return SetCurrentAlias(paths, aliasName)
 }
 
 func Rename(paths config.Paths, oldName, newName string) error {
@@ -329,7 +394,10 @@ func Rename(paths config.Paths, oldName, newName string) error {
 		return fmt.Errorf("invalid new account name: %w", err)
 	}
 
-	oldPath := filepath.Join(paths.AccountsDir, oldName+".json")
+	oldPath, oldAlias, ok := resolveAccountPathByName(paths, oldName)
+	if !ok {
+		return fmt.Errorf("Account does not exist: %s", oldName)
+	}
 	newPath := filepath.Join(paths.AccountsDir, newName+".json")
 	oldInfo, err := os.Stat(oldPath)
 	if err != nil {
@@ -348,11 +416,11 @@ func Rename(paths config.Paths, oldName, newName string) error {
 	}
 
 	meta := loadSyncMeta(paths)
-	if value, ok := meta.LastChecked[oldName]; ok {
+	if value, ok := meta.LastChecked[oldAlias]; ok {
 		meta.LastChecked[newName] = value
-		delete(meta.LastChecked, oldName)
+		delete(meta.LastChecked, oldAlias)
 	}
-	if meta.CurrentAlias == oldName {
+	if strings.EqualFold(meta.CurrentAlias, oldAlias) {
 		meta.CurrentAlias = newName
 	}
 	_ = saveSyncMeta(paths, meta)
@@ -365,19 +433,16 @@ func Delete(paths config.Paths, name string) error {
 		return err
 	}
 
-	target := filepath.Join(paths.AccountsDir, name+".json")
-	if _, err := os.Stat(target); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("Account does not exist: %s", name)
-		}
-		return err
+	target, aliasName, ok := resolveAccountPathByName(paths, name)
+	if !ok {
+		return fmt.Errorf("Account does not exist: %s", name)
 	}
 	if err := os.Remove(target); err != nil {
 		return err
 	}
 	meta := loadSyncMeta(paths)
-	delete(meta.LastChecked, name)
-	if meta.CurrentAlias == name {
+	delete(meta.LastChecked, aliasName)
+	if strings.EqualFold(meta.CurrentAlias, aliasName) {
 		meta.CurrentAlias = ""
 	}
 	_ = saveSyncMeta(paths, meta)
@@ -548,6 +613,16 @@ func listAccountFiles(paths config.Paths) []string {
 	return files
 }
 
+func resolveAccountPathByName(paths config.Paths, name string) (string, string, bool) {
+	for _, path := range listAccountFiles(paths) {
+		alias := stem(path)
+		if strings.EqualFold(alias, name) {
+			return path, alias, true
+		}
+	}
+	return "", "", false
+}
+
 func sameFile(left, right string) (bool, error) {
 	leftBytes, err := os.ReadFile(left)
 	if err != nil {
@@ -606,6 +681,17 @@ func stringValue(value any) string {
 	return text
 }
 
+func debugCurrentAccountEnabled() bool {
+	return strings.TrimSpace(os.Getenv("CODEX_SWITCH_DEBUG_CURRENT_ACCOUNT")) != ""
+}
+
+func debugCurrentAccount(format string, args ...any) {
+	if !debugCurrentAccountEnabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[current-account] "+format+"\n", args...)
+}
+
 func validateAccountName(name string) error {
 	text := strings.TrimSpace(name)
 	if text == "" {
@@ -630,4 +716,207 @@ func validateAccountName(name string) error {
 type usageResult struct {
 	data map[string]any
 	err  error
+}
+
+type subscriptionResult struct {
+	data map[string]any
+	err  error
+}
+
+type listRowPreparation struct {
+	currentName string
+	meta        SyncMeta
+	items       []preparedListItem
+}
+
+type preparedListItem struct {
+	snapshot *Snapshot
+	event    *ListRowEvent
+}
+
+func prepareListRows(paths config.Paths, now time.Time) listRowPreparation {
+	files := listAccountFiles(paths)
+	currentName := DetectCurrentAccountName(paths)
+	meta := loadSyncMeta(paths)
+	items := make([]preparedListItem, 0, len(files))
+
+	for _, path := range files {
+		snapshot, err := ReadSnapshot(path, now)
+		if err != nil {
+			item := preparedListItem{
+				event: &ListRowEvent{
+					Row: ListRow{
+						Marker:      " ",
+						Ready:       "UNK",
+						Account:     stem(path),
+						Plan:        "-",
+						FiveHour:    "unavailable (-)",
+						Weekly:      "unavailable (-)",
+						LastChecked: support.FormatRelativeAge(support.ParseISOToTime(meta.LastChecked[stem(path)]), now),
+					},
+					Note: fmt.Sprintf("%s: read failed: %v", stem(path), err),
+				},
+			}
+			items = append(items, item)
+			continue
+		}
+		items = append(items, preparedListItem{snapshot: snapshot})
+	}
+
+	return listRowPreparation{
+		currentName: currentName,
+		meta:        meta,
+		items:       items,
+	}
+}
+
+func buildListRowEvent(snapshot *Snapshot, currentName string, meta SyncMeta, localOnly bool, now time.Time, fetched usageResult, subscriptionFetched subscriptionResult) ListRowEvent {
+	row := ListRow{
+		Marker:   " ",
+		Ready:    "UNK",
+		Account:  fmt.Sprintf("%s <%s>", snapshot.Name, snapshot.Email),
+		Plan:     snapshot.Plan,
+		FiveHour: "local only (-)",
+		Weekly:   "local only (-)",
+	}
+	if snapshot.Name == currentName {
+		row.Marker = "*"
+	}
+
+	event := ListRowEvent{
+		Row:       row,
+		IsCurrent: snapshot.Name == currentName,
+	}
+
+	if localOnly {
+		row.LastChecked = support.FormatRelativeAge(lastCheckedTime(snapshot, meta), now)
+		event.Row = row
+		return event
+	}
+
+	if fetched.data != nil {
+		if email, ok := fetched.data["email"].(string); ok && email != "" {
+			row.Account = fmt.Sprintf("%s <%s>", snapshot.Name, email)
+		}
+		if plan, ok := fetched.data["plan_type"].(string); ok && plan != "" {
+			row.Plan = plan
+		}
+		rateLimit, _ := fetched.data["rate_limit"].(map[string]any)
+		if allowed, ok := rateLimit["allowed"].(bool); ok && allowed {
+			row.Ready = "YES"
+		} else {
+			row.Ready = "NO"
+		}
+		fiveHour, resetFiveHour, weekly, resetWeekly := usage.SummarizeRateLimit(rateLimit, now)
+		row.FiveHour = fmt.Sprintf("%s (%s)", fiveHour, resetFiveHour)
+		row.Weekly = fmt.Sprintf("%s (%s)", weekly, resetWeekly)
+	} else {
+		row.Ready = "UNK"
+		row.FiveHour = fmt.Sprintf("unavailable (%s)", snapshot.TokenExpiry)
+		row.Weekly = "unavailable (-)"
+		if fetched.err != nil {
+			event.Note = fmt.Sprintf("%s: usage lookup failed: %v", snapshot.Name, fetched.err)
+		}
+	}
+	if subscriptionFetched.data != nil {
+		summary := subscription.Summarize(subscriptionFetched.data)
+		if summary != "" && summary != "-" {
+			row.Plan = summary
+		}
+	} else if subscriptionFetched.err != nil {
+		if event.Note == "" {
+			event.Note = fmt.Sprintf("%s: subscription lookup failed: %v", snapshot.Name, subscriptionFetched.err)
+		} else {
+			event.Note += fmt.Sprintf("; subscription lookup failed: %v", subscriptionFetched.err)
+		}
+	}
+
+	row.LastChecked = support.FormatRelativeAge(lastCheckedTime(snapshot, meta), now)
+	event.Row = row
+	return event
+}
+
+func lastCheckedTime(snapshot *Snapshot, meta SyncMeta) *time.Time {
+	if snapshot.LastRefreshTime != nil {
+		return snapshot.LastRefreshTime
+	}
+	return support.ParseISOToTime(meta.LastChecked[snapshot.Name])
+}
+
+func usageResultForSnapshot(usageByToken map[string]usageResult, snapshot *Snapshot) usageResult {
+	token := strings.TrimSpace(snapshot.Tokens["access_token"])
+	if token == "" {
+		return usageResult{err: fmt.Errorf("missing access_token")}
+	}
+	if fetched, ok := usageByToken[token]; ok {
+		return fetched
+	}
+	return usageResult{err: fmt.Errorf("usage response missing")}
+}
+
+func subscriptionResultForSnapshot(subscriptionByAccount map[string]subscriptionResult, snapshot *Snapshot) subscriptionResult {
+	accountID := strings.TrimSpace(snapshot.AccountID)
+	if accountID == "" {
+		return subscriptionResult{err: fmt.Errorf("missing account_id")}
+	}
+	if fetched, ok := subscriptionByAccount[accountID]; ok {
+		return fetched
+	}
+	return subscriptionResult{err: fmt.Errorf("subscription response missing")}
+}
+
+func fetchSubscriptionsConcurrently(cfg config.Config, client *http.Client, snapshots map[string]*Snapshot) map[string]subscriptionResult {
+	unique := map[string]*Snapshot{}
+	for _, snapshot := range snapshots {
+		accountID := strings.TrimSpace(snapshot.AccountID)
+		if accountID == "" {
+			continue
+		}
+		unique[accountID] = snapshot
+	}
+
+	results := map[string]subscriptionResult{}
+	if len(unique) == 0 {
+		return results
+	}
+
+	workers := cfg.Network.MaxUsageWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan *Snapshot)
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for snapshot := range jobs {
+				data, err := subscription.Fetch(client, cfg, snapshot.Tokens["access_token"], snapshot.AccountID)
+				mu.Lock()
+				results[strings.TrimSpace(snapshot.AccountID)] = subscriptionResult{data: data, err: err}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for _, snapshot := range unique {
+		jobs <- snapshot
+	}
+	close(jobs)
+	wg.Wait()
+
+	return results
+}
+
+func appendListRowEvent(result *ListRowsResult, event ListRowEvent) {
+	result.Rows = append(result.Rows, event.Row)
+	if event.IsCurrent {
+		result.CurrentIndices[len(result.Rows)-1] = struct{}{}
+	}
+	if event.Note != "" {
+		result.Notes = append(result.Notes, event.Note)
+	}
 }
