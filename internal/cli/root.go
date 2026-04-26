@@ -14,6 +14,7 @@ import (
 	"codex-switch/internal/accounts"
 	"codex-switch/internal/auth"
 	"codex-switch/internal/config"
+	"codex-switch/internal/hermesaccounts"
 	"codex-switch/internal/sessions"
 	"codex-switch/internal/support"
 	"codex-switch/internal/usage"
@@ -83,6 +84,7 @@ func (a *App) newRootCmd() *cobra.Command {
 	rootCmd.AddCommand(a.newTokenInfoCmd())
 	rootCmd.AddCommand(a.newSaveCmd())
 	rootCmd.AddCommand(a.newUseCmd())
+	rootCmd.AddCommand(a.newHermesCmd())
 	rootCmd.AddCommand(a.newListCmd())
 	rootCmd.AddCommand(a.newCurrentCmd())
 	rootCmd.AddCommand(a.newThreadsCmd())
@@ -181,6 +183,111 @@ func (a *App) newUseCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&relaunch, "relaunch", false, "Prompt to relaunch Codex App after switching")
 	cmd.Flags().BoolVar(&force, "force", false, "Force Codex App to quit during --relaunch")
 	return cmd
+}
+
+func (a *App) newHermesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "hermes",
+		Short: "Manage Hermes Codex accounts",
+	}
+	cmd.AddCommand(a.newHermesSaveCmd())
+	cmd.AddCommand(a.newHermesUseCmd())
+	cmd.AddCommand(a.newHermesListCmd())
+	cmd.AddCommand(a.newHermesCurrentCmd())
+	return cmd
+}
+
+func (a *App) newHermesSaveCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:               "save <name>",
+		Short:             "Save the current Hermes Codex account",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeHermesAccountNames(a.Paths),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			if err := hermesaccounts.Save(a.Paths, name, force); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("Saved Hermes %s", name)))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing saved Hermes alias")
+	return cmd
+}
+
+func (a *App) newHermesUseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:               "use <name>",
+		Short:             "Switch Hermes to a saved Codex account",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: completeHermesAccountNames(a.Paths),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := args[0]
+			if err := hermesaccounts.Use(a.Paths, name); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("Switched Hermes to %s", name)))
+			source, err := restartHermesGateway(a.Paths)
+			if err != nil {
+				return fmt.Errorf("Hermes account switched, but restart failed: %w", err)
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), colorize(fmt.Sprintf("Restarted Hermes gateway via %s", source)))
+			return nil
+		},
+	}
+}
+
+func (a *App) newHermesListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List Hermes-compatible Codex accounts",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			entries := hermesaccounts.ListAvailableAccounts(a.Paths)
+			if len(entries) == 0 {
+				printInfo(cmd.OutOrStdout(), "No Hermes-compatible accounts found.")
+				return nil
+			}
+			current := hermesaccounts.CurrentName(a.Paths)
+			for _, entry := range entries {
+				marker := " "
+				if current != "" && strings.EqualFold(current, entry.Name) {
+					marker = "*"
+				}
+				detail := ""
+				if entry.Err == nil && entry.Snapshot != nil {
+					switch {
+					case entry.Snapshot.Email != "":
+						detail = " <" + entry.Snapshot.Email + ">"
+					case entry.Snapshot.AccountID != "":
+						detail = " <" + entry.Snapshot.AccountID + ">"
+					}
+				}
+				if !entry.Imported {
+					detail += " [codex]"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%s %s%s\n", marker, entry.Name, detail)
+			}
+			return nil
+		},
+	}
+}
+
+func (a *App) newHermesCurrentCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "current",
+		Short: "Show the current Hermes Codex account",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			name := hermesaccounts.CurrentName(a.Paths)
+			if name == "" {
+				printInfo(cmd.OutOrStdout(), "Current Hermes account is unnamed (not saved).")
+				return nil
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), colorize(name))
+			return nil
+		},
+	}
 }
 
 func (a *App) newListCmd() *cobra.Command {
@@ -993,6 +1100,22 @@ func completeAccountNames(paths config.Paths) func(*cobra.Command, []string, str
 	}
 }
 
+func completeHermesAccountNames(paths config.Paths) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		if len(args) > 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		names := hermesaccounts.ListAvailableAccountNames(paths)
+		filtered := []string{}
+		for _, name := range names {
+			if strings.HasPrefix(strings.ToLower(name), strings.ToLower(toComplete)) {
+				filtered = append(filtered, name)
+			}
+		}
+		return filtered, cobra.ShellCompDirectiveNoFileComp
+	}
+}
+
 func completeRenameArgs(paths config.Paths) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 	return func(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		if len(args) > 0 {
@@ -1003,7 +1126,7 @@ func completeRenameArgs(paths config.Paths) func(*cobra.Command, []string, strin
 }
 
 func shouldSkipRuntimePreparation(cmd *cobra.Command) bool {
-	skipped := []string{"completion", "install-completion", "__complete", "__completeNoDesc"}
+	skipped := []string{"completion", "install-completion", "hermes", "__complete", "__completeNoDesc"}
 	for current := cmd; current != nil; current = current.Parent() {
 		if slices.Contains(skipped, current.Name()) {
 			return true
@@ -1645,15 +1768,16 @@ func sortHelpRows(cmd *cobra.Command, rows []helpRow) {
 			"current":            2,
 			"use":                3,
 			"save":               4,
-			"sync":               5,
-			"token-info":         6,
-			"rename":             7,
-			"delete":             8,
-			"prune":              9,
-			"doctor":             10,
-			"install-completion": 11,
-			"completion":         12,
-			"help":               13,
+			"hermes":             5,
+			"sync":               6,
+			"token-info":         7,
+			"rename":             8,
+			"delete":             9,
+			"prune":              10,
+			"doctor":             11,
+			"install-completion": 12,
+			"completion":         13,
+			"help":               14,
 		}
 	}
 

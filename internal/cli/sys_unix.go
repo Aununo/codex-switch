@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"os/exec"
 )
 
 func execCommand(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
+}
+
+func execCommandContext(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, name, args...)
 }
 
 func execLookPath(file string) (string, error) {

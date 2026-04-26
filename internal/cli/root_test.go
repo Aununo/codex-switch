@@ -1206,6 +1206,93 @@ func TestUseWithRelaunchPromptsBeforeRestartingApp(t *testing.T) {
 	}
 }
 
+func TestHermesUseSwitchesHermesAuthWithoutPreparingCodexRuntime(t *testing.T) {
+	t.Setenv("HERMES_HOME", "")
+	paths := config.PathsFromHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.HermesAuthFile), 0o755); err != nil {
+		t.Fatalf("MkdirAll Hermes auth dir: %v", err)
+	}
+	if err := os.MkdirAll(paths.HermesAccountsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll Hermes accounts dir: %v", err)
+	}
+	current := `{
+  "providers": {
+    "anthropic": {"access_token": "keep"},
+    "openai-codex": {"tokens": {"account_id": "old", "access_token": "old-access", "refresh_token": "old-refresh"}}
+  }
+}`
+	if err := os.WriteFile(paths.HermesAuthFile, []byte(current), 0o600); err != nil {
+		t.Fatalf("WriteFile Hermes auth: %v", err)
+	}
+	saved := `{
+  "providers": {
+    "openai-codex": {"tokens": {"account_id": "new", "access_token": "new-access", "refresh_token": "new-refresh"}}
+  },
+  "credential_pool": {
+    "openai-codex": [{"access_token": "new-access", "refresh_token": "new-refresh"}]
+  }
+}`
+	if err := os.WriteFile(filepath.Join(paths.HermesAccountsDir, "work.json"), []byte(saved), 0o600); err != nil {
+		t.Fatalf("WriteFile Hermes account: %v", err)
+	}
+	unitDir := filepath.Join(paths.HomeDir, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, "hermes-gateway.service"), []byte("[Service]\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile unit: %v", err)
+	}
+	binDir := filepath.Join(paths.HomeDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll bin dir: %v", err)
+	}
+	restartLog := filepath.Join(paths.HomeDir, "restart.log")
+	systemctl := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> '" + restartLog + "'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte(systemctl), 0o755); err != nil {
+		t.Fatalf("WriteFile systemctl: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	app := &App{
+		Paths:          paths,
+		Now:            time.Now,
+		PrepareRuntime: true,
+	}
+	cmd := app.newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"hermes", "use", "work"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	doc := readRootTestJSON(t, paths.HermesAuthFile)
+	if got := nestedRootTestString(doc, "providers", "openai-codex", "tokens", "account_id"); got != "new" {
+		t.Fatalf("expected Hermes auth to switch, got %q", got)
+	}
+	if got := nestedRootTestString(doc, "providers", "anthropic", "access_token"); got != "keep" {
+		t.Fatalf("expected non-Codex Hermes provider to be preserved, got %q", got)
+	}
+	if _, err := os.Stat(paths.ConfigFile); !os.IsNotExist(err) {
+		t.Fatalf("expected Hermes command to skip Codex config preparation, stat err=%v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("Switched Hermes to work")) {
+		t.Fatalf("expected switch confirmation, got %q", out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("Restarted Hermes gateway via systemd user service")) {
+		t.Fatalf("expected restart confirmation, got %q", out.String())
+	}
+	restartBytes, err := os.ReadFile(restartLog)
+	if err != nil {
+		t.Fatalf("ReadFile restart log: %v", err)
+	}
+	if !bytes.Contains(restartBytes, []byte("--user restart hermes-gateway.service")) {
+		t.Fatalf("expected systemd restart command, got %q", string(restartBytes))
+	}
+}
+
 func TestThreadsListsActiveSessions(t *testing.T) {
 	paths := config.PathsFromHome(t.TempDir())
 	cfg, err := config.Load(paths)
@@ -1598,4 +1685,30 @@ printf 'open:%s:checks=%s\n' "$*" "$count" >> '` + logPath + `'
 	if !strings.Contains(logText, "open:-a Codex:checks=3") {
 		t.Fatalf("expected open to happen after the third check, got %q", logText)
 	}
+}
+
+func readRootTestJSON(t *testing.T, path string) map[string]any {
+	t.Helper()
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile %s: %v", path, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(bytes, &doc); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	return doc
+}
+
+func nestedRootTestString(value any, path ...string) string {
+	current := value
+	for _, part := range path {
+		typed, ok := current.(map[string]any)
+		if !ok {
+			return ""
+		}
+		current = typed[part]
+	}
+	text, _ := current.(string)
+	return text
 }

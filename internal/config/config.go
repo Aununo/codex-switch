@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"codex-switch/internal/support"
@@ -21,12 +22,15 @@ const (
 )
 
 type Paths struct {
-	HomeDir      string
-	CodexDir     string
-	AuthFile     string
-	AccountsDir  string
-	SyncMetaFile string
-	ConfigFile   string
+	HomeDir           string
+	CodexDir          string
+	AuthFile          string
+	AccountsDir       string
+	SyncMetaFile      string
+	ConfigFile        string
+	HermesDir         string
+	HermesAuthFile    string
+	HermesAccountsDir string
 }
 
 type Config struct {
@@ -59,14 +63,34 @@ func DefaultPaths() (Paths, error) {
 
 func PathsFromHome(home string) Paths {
 	codexDir := filepath.Join(home, ".codex")
+	hermesDir := hermesDirFromHome(home)
 	return Paths{
-		HomeDir:      home,
-		CodexDir:     codexDir,
-		AuthFile:     filepath.Join(codexDir, "auth.json"),
-		AccountsDir:  filepath.Join(codexDir, "accounts"),
-		SyncMetaFile: filepath.Join(codexDir, "accounts_sync_meta.json"),
-		ConfigFile:   filepath.Join(codexDir, "codex-switch.json"),
+		HomeDir:           home,
+		CodexDir:          codexDir,
+		AuthFile:          filepath.Join(codexDir, "auth.json"),
+		AccountsDir:       filepath.Join(codexDir, "accounts"),
+		SyncMetaFile:      filepath.Join(codexDir, "accounts_sync_meta.json"),
+		ConfigFile:        filepath.Join(codexDir, "codex-switch.json"),
+		HermesDir:         hermesDir,
+		HermesAuthFile:    filepath.Join(hermesDir, "auth.json"),
+		HermesAccountsDir: filepath.Join(hermesDir, "accounts"),
 	}
+}
+
+func hermesDirFromHome(home string) string {
+	if value := strings.TrimSpace(os.Getenv("HERMES_HOME")); value != "" {
+		if value == "~" {
+			return home
+		}
+		if strings.HasPrefix(value, "~/") {
+			return filepath.Join(home, strings.TrimPrefix(value, "~/"))
+		}
+		if filepath.IsAbs(value) {
+			return filepath.Clean(value)
+		}
+		return filepath.Join(home, value)
+	}
+	return filepath.Join(home, ".hermes")
 }
 
 func DefaultConfig() Config {

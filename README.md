@@ -20,6 +20,8 @@ make build
 ./bin/codex-switch use work
 ./bin/codex-switch use work --relaunch
 ./bin/codex-switch use work --relaunch --force
+./bin/codex-switch hermes save work
+./bin/codex-switch hermes use work
 ./bin/codex-switch list
 ./bin/codex-switch current
 ./bin/codex-switch threads
@@ -46,6 +48,40 @@ To force-close and reopen the Codex app during the relaunch flow:
 `--force` only works together with `--relaunch`.
 
 When active Codex threads are detected, the CLI shows them and asks for an extra confirmation before relaunching.
+
+## Hermes accounts
+
+Hermes keeps its own Codex OAuth state in `~/.hermes/auth.json`, separate from Codex CLI's `~/.codex/auth.json`.
+
+Use the `hermes` subcommands when you want to save or switch the Codex account used by Hermes without changing the account used by the Codex CLI:
+
+```bash
+./bin/codex-switch hermes save work
+./bin/codex-switch hermes use work
+./bin/codex-switch hermes list
+./bin/codex-switch hermes current
+```
+
+`hermes save <name>` copies the current Hermes Codex provider state from `~/.hermes/auth.json` into `~/.hermes/accounts/<name>.json`.
+Use `--force` to overwrite an existing Hermes alias:
+
+```bash
+./bin/codex-switch hermes save work --force
+```
+
+`hermes use <name>` switches only the Hermes auth file. It preserves any non-Codex providers already stored in `~/.hermes/auth.json`.
+
+Hermes commands also understand Codex saved aliases from `~/.codex/accounts`. If `~/.hermes/accounts/<name>.json` does not exist yet, `hermes use <name>` can import a compatible `~/.codex/accounts/<name>.json` automatically, then switch Hermes to that account. A Codex alias must include both `access_token` and `refresh_token` to be considered importable.
+
+`hermes list`, `hermes current`, shell completion, and `hermes use <name>` read the union of saved Hermes snapshots and importable Codex aliases.
+Saved Hermes account snapshots are stored in `~/.hermes/accounts`.
+Set `HERMES_HOME` if your Hermes installation uses a different home directory:
+
+```bash
+HERMES_HOME=/path/to/hermes ./bin/codex-switch hermes list
+```
+
+After `hermes use`, the CLI restarts the Hermes gateway so long-running Hermes processes pick up the new account. It prefers `systemctl --user restart hermes-gateway.service` when the user systemd service exists; if that service is not installed, it falls back to `hermes gateway restart`.
 
 ## Active threads
 
